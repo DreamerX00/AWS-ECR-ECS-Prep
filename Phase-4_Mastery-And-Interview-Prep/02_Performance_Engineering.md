@@ -1,8 +1,8 @@
-# 🔧 Performance Engineering — CPU, Memory & Network Tuning
+# Performance Engineering — CPU, Memory & Network Tuning
 
 ---
 
-## 📖 CPU Units in ECS
+## CPU Units in ECS
 
 ```
 ECS CPU units:
@@ -14,7 +14,7 @@ Task-level CPU:
   1024  = 1 vCPU
   2048  = 2 vCPU
   4096  = 4 vCPU
-  
+
 Container-level CPU (within task):
   - Soft reservation: task CPU shared among containers
   - Hard limit: not available (CPU is elastic)
@@ -36,15 +36,17 @@ How it works:
 Detection:
   CloudWatch metric: CPUThrottledTime (Container Insights)
   High CPUThrottledTime → increase CPU units!
-  
+
 Fix: Increase container CPU allocation
   256 → 512 → observe if latency improves
   Or: Optimize app code (reduce CPU usage per request)
 ```
 
+CPU throttling is insidious because it does not appear as an error — it manifests as intermittent latency spikes that are hard to reproduce in lower environments. The `CPUThrottledTime` metric in Container Insights is the key diagnostic. If this metric is non-zero and trending upward under load, your containers are CPU-constrained and need more CPU allocation.
+
 ---
 
-## 💾 Memory — Hard vs Soft Limits
+## Memory — Hard vs Soft Limits
 
 ```
 Task Definition container memory settings:
@@ -61,7 +63,7 @@ Example:
   Container A: memory=512, memoryReservation=256
   Container B: memory=256, memoryReservation=128
   Container C (sidecar): memory=128, memoryReservation=64
-  
+
   Scheduler checks: 256 + 128 + 64 = 448MB available on host? Schedule!
   Runtime: If A uses 600MB → OOM killed (hard limit 512 exceeded!)
 
@@ -90,9 +92,11 @@ aws cloudwatch put-metric-alarm \
   --evaluation-periods 2
 ```
 
+A memory leak in a long-running container will eventually cause an OOM kill, which restarts the task. The symptom is periodic task restarts every few hours or days. The diagnostic is the MemoryUtilized metric trending upward over time without a corresponding increase in traffic. Use heap profiling tools specific to your language runtime to identify the leak source.
+
 ---
 
-## 🌐 Network Throughput Considerations
+## Network Throughput Considerations
 
 ### Fargate Network Bandwidth:
 ```
@@ -113,16 +117,16 @@ High-bandwidth workloads (video streaming, large file transfers):
 ECS on EC2:
   Enable: Enhanced Networking (ENA) on instance
   Benefit: Lower latency, higher PPS (packets per second)
-  
-  Modern ECS-optimized AMIs have ENA by default!
-  
+
+  Modern ECS-optimized AMIs have ENA enabled by default!
+
   c5n.18xlarge: 100 Gbps network bandwidth!
   Good for: Large-scale data processing, ML training data loading
 ```
 
 ---
 
-## 🚀 Task Startup Optimization
+## Task Startup Optimization
 
 ### Fargate Task Boot Time Optimization:
 ```
@@ -131,22 +135,43 @@ Total startup time components:
   2. Image pull: 5-120s (MOST CONTROLLABLE!)
   3. Container start: 1-5s
   4. App initialization: YOUR app's startup time
-  
+
 Optimize image pull:
   - Keep image < 200MB: 8-15s pull time on Fargate
   - Large image (1GB): 60-90s pull time!
   - ECR in same region: No cross-region latency
   - Docker layer caching: Fargate caches layers between tasks (somewhat)
-  
+
 Optimize app init:
-  - Eliminate heavy startup tasks (don't run migrations at startup!)
+  - Eliminate heavy startup tasks (do not run migrations at startup!)
   - Lazy initialization (connect to DB on first request, not immediately)
   - Health check startPeriod = actual boot time + 30s buffer
 ```
 
+Image size is the most impactful factor you can control for Fargate startup time. Multi-stage Docker builds are the primary tool for reducing image size:
+
+```dockerfile
+# Multi-stage build example:
+# Stage 1: Build (includes all build tools)
+FROM node:18 AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY . .
+RUN npm run build
+
+# Stage 2: Production (minimal runtime only)
+FROM node:18-alpine AS production
+WORKDIR /app
+COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/node_modules ./node_modules
+# Result: 50-80% smaller than single-stage build
+CMD ["node", "dist/server.js"]
+```
+
 ---
 
-## ⚡ JVM Optimization for ECS/Fargate
+## JVM Optimization for ECS/Fargate
 
 ```java
 // JVM in containers needs special tuning!
@@ -165,9 +190,9 @@ Optimize app init:
 
 // Full JVM flags for ECS Fargate (add to JAVA_OPTS or CMD in Dockerfile):
 // Task: 2 vCPU, 4GB memory
-CMD ["java", 
+CMD ["java",
   "-XX:+UseContainerSupport",
-  "-XX:MaxRAMPercentage=75", 
+  "-XX:MaxRAMPercentage=75",
   "-XX:+UseG1GC",
   "-XX:MaxGCPauseMillis=200",
   "-Djava.security.egd=file:/dev/./urandom",
@@ -176,12 +201,14 @@ CMD ["java",
 // Result: Max heap = 3GB (75% of 4GB container), much better!
 ```
 
+Without `-XX:+UseContainerSupport`, a JVM running in a 2GB Fargate container on a host with 64GB RAM will calculate its default heap as 25% of 64GB = 16GB. The container's hard memory limit of 2GB will then OOM-kill the JVM before it even starts up properly. This is one of the most common Java-in-containers bugs. Java 11+ enables `UseContainerSupport` by default, but older JVMs require it to be set explicitly.
+
 ---
 
-## 🎯 Performance Testing Pattern
+## Performance Testing Pattern
 
 ```bash
-# Before deploying to production: Load test ECS service
+# Before deploying to production: load test ECS service
 # Tools: k6, locust, JMeter
 
 # k6 load test against ECS service (via ALB):
@@ -208,15 +235,63 @@ k6 run --vus 100 --duration 5m script.js
 
 ---
 
-## 🎤 Interview Angle
+## Connection Pool Sizing for Containerized Services
 
-**Q: "ECS container mein CPU units aur memory limits kaise kaam karte hain?"**
+When running many small ECS tasks, each task's database connection pool multiplies:
 
-> CPU: 1024 units = 1 vCPU. Task-level CPU = total budget. Container-level CPU = soft reservation (for scheduling + proportional time sharing). CPU kan burst beyond reservation if host has slack — no hard CPU cap in ECS (unlike K8s CPU limits).
+```
+Example: RDS PostgreSQL, max_connections = 500
+
+10 tasks × 10 connections per pool = 100 connections (safe)
+100 tasks × 10 connections per pool = 1000 connections (exceeded limit!)
+
+Solution 1: Reduce pool size per task
+  10 connections → 3 connections per task
+  100 tasks × 3 = 300 connections (safe)
+
+Solution 2: RDS Proxy
+  All tasks connect to RDS Proxy → Proxy multiplexes to RDS
+  Tasks can have large pools, Proxy reuses connections
+  Max task connections ≠ Max RDS connections (proxied!)
+```
+
+RDS Proxy is essential for workloads that scale ECS tasks aggressively, especially with auto-scaling. Without it, database connection exhaustion becomes the scaling ceiling.
+
+---
+
+## Latency Optimization Checklist
+
+```
+Network Latency:
+  ✅ ECS tasks and RDS in same AZ (dev/staging) or same region (prod)
+  ✅ ECR VPC endpoint (eliminates NAT Gateway latency for image pulls)
+  ✅ ElastiCache for caching repeated queries
+  ✅ Connection pooling enabled
+
+Application Latency:
+  ✅ Async non-blocking I/O (Node.js, Java NIO, Go goroutines)
+  ✅ Avoid synchronous calls in hot path
+  ✅ Cache expensive computations in memory
+  ✅ Database query optimization (indexes, query plans)
+
+Infrastructure Latency:
+  ✅ Fargate task size adequate for throughput (CPU not throttling)
+  ✅ ALB targets in same region as ALB
+  ✅ Keep-alive connections between ALB and targets
+  ✅ HTTP/2 enabled on ALB for multiplexing
+```
+
+---
+
+## Interview Angle
+
+**Q: "How do CPU units and memory limits work in ECS containers?"**
+
+> CPU: 1024 units equals 1 vCPU. The task-level CPU is the total budget. Container-level CPU is a soft reservation that influences proportional time-sharing and scheduling, but containers can burst beyond their reservation if the host has spare CPU cycles. There is no hard CPU cap in ECS (unlike Kubernetes CPU limits). High `CPUThrottledTime` in CloudWatch indicates the container is CPU-constrained.
 >
-> Memory: Hard limit (`memory`) = enforcement. Container exceeds this → OOM kill (exit code 137). Soft limit (`memoryReservation`) = scheduling consideration. Set memory = (peak usage + 20% buffer). Set memoryReservation = typical usage.
+> Memory: The hard limit (`memory`) is enforced at runtime. If the container exceeds this limit, the Linux kernel sends SIGKILL and the container exits with code 137. The soft limit (`memoryReservation`) is used only for scheduling decisions. Set the hard memory limit to (peak observed usage + 20% buffer), and set memoryReservation to the typical usage.
 >
-> Gotcha: JVM defaults to 25% of HOST RAM for heap. In containers, use `-XX:+UseContainerSupport` (Java 11+ default) + `-XX:MaxRAMPercentage=75` to properly use container memory.
+> Gotcha: JVM defaults to calculating heap size based on host RAM, not container limits. In containers, use `-XX:+UseContainerSupport` (enabled by default in Java 11+) and `-XX:MaxRAMPercentage=75` to correctly scope the heap to the container's memory allocation.
 
 ---
 

@@ -1,8 +1,8 @@
-# 🧠 Advanced Architecture Patterns
+# Advanced Architecture Patterns
 
 ---
 
-## 1️⃣ Sidecar Pattern
+## 1. Sidecar Pattern
 
 ### What is it?
 ```
@@ -13,6 +13,8 @@ Main container: Does the core business logic
 Sidecar:        Handles cross-cutting concerns (logging, metrics, TLS, etc.)
 ```
 
+The sidecar pattern keeps your main application container focused on business logic, while infrastructure concerns (logging, observability, security) are handled by dedicated sidecar containers. This separation makes it easy to swap out infrastructure tooling without touching application code, and allows platform teams to standardize sidecars across all services.
+
 ### Pattern A: Log Router Sidecar
 ```json
 {
@@ -21,7 +23,7 @@ Sidecar:        Handles cross-cutting concerns (logging, metrics, TLS, etc.)
       "name": "app",
       "image": "myapp:v1",
       "logConfiguration": {
-        "logDriver": "awsfirelens"   ← Sends logs to sidecar!
+        "logDriver": "awsfirelens"   // Sends logs to sidecar!
       }
     },
     {
@@ -75,9 +77,13 @@ Sidecar:        Handles cross-cutting concerns (logging, metrics, TLS, etc.)
 }
 ```
 
+### Key Rule: Sidecar Should Be `essential: false`
+
+If the sidecar is marked `essential: true`, a sidecar crash will bring down the entire task — including your main application. Mark sidecars as `essential: false` so that the main application continues running even if a logging or monitoring sidecar fails. The exception is when the sidecar handles something truly critical (e.g., a security proxy that all traffic must pass through).
+
 ---
 
-## 2️⃣ Daemon Service Pattern
+## 2. Daemon Service Pattern
 
 ```
 "Run exactly one task per EC2 instance, always."
@@ -94,10 +100,10 @@ aws ecs create-service \
   --cluster production \
   --service-name fluentbit-daemon \
   --task-definition fluentbit:5 \
-  --scheduling-strategy DAEMON   ← Magic!
+  --scheduling-strategy DAEMON   # Magic!
   # No desiredCount needed (auto = number of instances)
 
-# Task def: Give daemon access to host paths
+# Task definition: Give daemon access to host paths
 # volumes:
 #   - host path: /var/log (to read all container logs from host)
 #   - host path: /var/run/docker.sock (to get container metadata)
@@ -115,15 +121,17 @@ aws ecs create-service \
     "image": "fluentbit:latest",
     "mountPoints": [{
       "sourceVolume": "varlog",
-      "containerPath": "/var/log/host"   ← access host /var/log
+      "containerPath": "/var/log/host"   // Access host /var/log
     }]
   }]
 }
 ```
 
+Daemon services are one of the primary reasons to run EC2-based ECS clusters instead of Fargate. Fargate does not support the DAEMON scheduling strategy because Fargate abstracts away the host EC2 instances. If you need to run exactly one agent per host (log forwarders, security scanners, disk backup agents), you need EC2 mode.
+
 ---
 
-## 3️⃣ Multi-Container Task Pattern
+## 3. Multi-Container Task Pattern
 
 ```
 Multiple containers in ONE task for tightly coupled functionality.
@@ -131,7 +139,7 @@ Multiple containers in ONE task for tightly coupled functionality.
 When to use:
   - Containers share localhost network (communicate via 127.0.0.1)
   - Containers share volumes (one writes, one reads)
-  - Containers need to start together (init container)
+  - Containers need to start in order (init container)
   - Sidecar patterns (any pattern above)
 ```
 
@@ -144,7 +152,7 @@ When to use:
       "name": "migrate",            // Run DB migrations first!
       "image": "myapp:v1",
       "command": ["node", "migrate.js"],
-      "essential": false,           // Not essential - will exit when done
+      "essential": false,           // Not essential — will exit when done
       "dependsOn": []
     },
     {
@@ -153,12 +161,20 @@ When to use:
       "essential": true,
       "dependsOn": [{
         "containerName": "migrate",
-        "condition": "SUCCESS"    ← Wait for migrations to succeed!
+        "condition": "SUCCESS"    // Wait for migrations to succeed!
       }]
     }
   ]
 }
 ```
+
+The `dependsOn` conditions are:
+- `START`: Wait for the container to start (PID 1 running)
+- `COMPLETE`: Wait for the container to exit (any exit code)
+- `SUCCESS`: Wait for the container to exit with code 0
+- `HEALTHY`: Wait for the container to pass its health check
+
+The `SUCCESS` condition is the most useful for init containers — it ensures the migration script completed successfully before starting the main application. If the migration fails, the main app never starts, preventing the application from running against an incompatible schema.
 
 ### Nginx + App Pattern
 ```json
@@ -181,12 +197,12 @@ When to use:
     }
   ]
 }
-// awsvpc: both containers share same namespace → can use localhost
+// awsvpc: both containers share same network namespace → can use localhost
 ```
 
 ---
 
-## 4️⃣ Event-Driven ECS Pattern
+## 4. Event-Driven ECS Pattern
 
 ```
 Trigger ECS tasks from SQS/SNS/EventBridge events.
@@ -221,7 +237,7 @@ aws pipes create-pipe \
           "Name": "transcoder",
           "Environment": [{
             "Name": "VIDEO_ID",
-            "Value": "$.body.videoId"   ← From SQS message!
+            "Value": "$.body.videoId"   // From SQS message!
           }]
         }]
       }
@@ -230,9 +246,13 @@ aws pipes create-pipe \
   --role-arn arn:aws:iam::123:role/pipes-execution-role
 ```
 
+The event-driven pattern is powerful for workloads where task count should directly correspond to the number of pending jobs. Each SQS message triggers exactly one ECS task. The task processes the job and exits. This is a clean model for batch processing — no need to manage worker pools, no idle workers consuming resources between jobs.
+
+A key operational consideration: ensure your tasks handle SQS visibility timeouts correctly. If a task takes longer than the visibility timeout to process a job, SQS will make the message visible again and potentially trigger a duplicate task.
+
 ---
 
-## 5️⃣ Blue/Green Deployment Pattern with CodeDeploy (Architecture View)
+## 5. Blue/Green Deployment Pattern with CodeDeploy (Architecture View)
 
 ```
 ALB Production Listener (443)
@@ -241,21 +261,21 @@ ALB Production Listener (443)
          └── [Green] Target Group → Green Tasks (new version)
 
 Deployment Flow:
-  Step 1: Launch green tasks (0% traffic)
+  Step 1: Launch green tasks (0% production traffic)
   Step 2: Test listener (8080) → 100% traffic to green
-  Step 3: Run automated tests via test listener!
+  Step 3: Run automated tests via test listener
   Step 4: If tests pass → Production listener switch (5% canary first, then 100%)
   Step 5: Blue tasks: keep for 30 minutes (rollback window)
   Step 6: Terminate blue tasks
 
 Rollback:
-  One command → switch listener back to blue
+  One API call → switch listener back to blue
   < 1 second switchback!
 ```
 
 ---
 
-## 🌍 Real-World: Complete Production Architecture
+## Real-World: Complete Production Architecture
 
 ```
 Production Architecture for 10M users:
@@ -314,22 +334,21 @@ Observability:
 
 ---
 
-## 🎤 Interview Angle
+## Interview Angle
 
-**Q: "Sidecar pattern kya hai? Production mein kaise use karte hain?"**
+**Q: "What is the sidecar pattern? How is it used in production?"**
 
-> Sidecar = secondary container in same ECS task as main app.
-> Same task network → localhost communication.
-> Use cases: Log routing (Fluent Bit), observability (X-Ray, Datadog), service mesh (Envoy).
-> essential: false — sidecar crash kare → main app chalti rahe.
-> Pattern: App → awsfirelens → Fluent Bit sidecar → CloudWatch + S3.
+> The sidecar pattern involves running a secondary container in the same ECS task as the main application. Since they share the same task network (awsvpc mode), they can communicate via localhost. The sidecar handles cross-cutting concerns so the main application stays focused on business logic.
+>
+> Common production uses: Log routing with Fluent Bit (receives logs from app via awsfirelens driver, routes to CloudWatch, S3, and OpenSearch simultaneously), observability with X-Ray daemon (receives trace data from app, batches and forwards to X-Ray service), and service mesh proxying with Envoy (intercepts all network traffic for retries, circuit breaking, mTLS).
+>
+> The sidecar should be marked `essential: false` so that a sidecar crash does not kill the main application task.
 
-**Q: "Multi-container ECS task mein dependency ordering kaise karte hain?"**
+**Q: "How do you control container startup order in a multi-container ECS task?"**
 
-> `dependsOn` field in container definition.
-> Conditions: START (container started), COMPLETE (exited any code), SUCCESS (exited 0), HEALTHY (health check passed).
-> Init container pattern: DB migration container → SUCCESS → then main app starts.
-> Useful for: schema migrations, data seeding, wait-for-dependency patterns.
+> The `dependsOn` field in the container definition controls startup ordering. It supports four conditions: `START` (container has started), `COMPLETE` (container has exited, any code), `SUCCESS` (container exited with code 0), and `HEALTHY` (container passed its health check).
+>
+> The most common use case is the init container pattern: a migration container runs DB schema migrations first. The main application container has `dependsOn: [{containerName: "migrate", condition: "SUCCESS"}]`. If the migration fails (non-zero exit), the main app never starts. This prevents application bugs where code runs against an incompatible database schema.
 
 ---
 

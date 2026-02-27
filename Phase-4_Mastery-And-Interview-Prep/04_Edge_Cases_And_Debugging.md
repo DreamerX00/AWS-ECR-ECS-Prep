@@ -1,8 +1,8 @@
-# 🧨 Edge Cases & Debugging Mastery
+# Edge Cases & Debugging Mastery
 
 ---
 
-## 🔴 EDGE CASE 1: Image Pull Failures
+## EDGE CASE 1: Image Pull Failures
 
 ### Scenario A: Private Subnet + No VPC Endpoint
 ```
@@ -15,14 +15,18 @@ Fix options:
      - com.amazonaws.us-east-1.ecr.dkr   (image pulls)
      - com.amazonaws.us-east-1.ecr.api   (API calls)
      - com.amazonaws.us-east-1.s3        (S3 gateway, for layer blobs)
-  
+
   2. Add NAT Gateway (expensive but quick fix)
-  
+
 Debug command:
   # Test from EC2 in same subnet:
   curl -I https://123456789.dkr.ecr.us-east-1.amazonaws.com/v2/
   # Timeout = no connectivity. 200 = OK.
 ```
+
+VPC Endpoints for ECR are strongly recommended for production deployments. Without them, every task startup requires a NAT Gateway to pull the image from ECR. This costs $0.045/GB in NAT Gateway data processing fees and adds latency. VPC Endpoints route traffic privately within the AWS network at $0.01/GB — 78% cheaper and faster.
+
+Note: ECR image layers are stored in S3. You need both the ECR interface endpoints (`ecr.dkr` and `ecr.api`) AND the S3 gateway endpoint. Without the S3 gateway endpoint, image layer downloads will fail even if the ECR endpoints are configured.
 
 ### Scenario B: Wrong Execution Role Permissions
 ```
@@ -31,7 +35,7 @@ Error: "AccessDeniedException: User: arn:aws:sts::123:assumed-role/ecsTaskExecut
 Debug:
   aws cloudtrail lookup-events \
     --lookup-attributes AttributeKey=EventName,AttributeValue=GetAuthorizationToken
-  # → See who called it, what denied
+  # → See who called it, what was denied
 
   # Add to Execution Role:
   ecr:GetAuthorizationToken   → Resource: * (required)
@@ -42,7 +46,7 @@ Debug:
 
 ---
 
-## 🔴 EDGE CASE 2: ENI Exhaustion (EC2 awsvpc mode)
+## EDGE CASE 2: ENI Exhaustion (EC2 awsvpc mode)
 
 ```
 Symptom: Tasks stuck in PROVISIONING for minutes
@@ -52,7 +56,7 @@ Debug:
   # Count ENIs per instance:
   aws ec2 describe-instances --instance-ids i-abc \
     --query 'Reservations[0].Instances[0].NetworkInterfaces[*].NetworkInterfaceId'
-  
+
   # Check ENI limit for instance type:
   aws ec2 describe-instance-types --instance-types c5.xlarge \
     --query 'InstanceTypes[0].NetworkInfo.MaximumNetworkInterfaces'
@@ -67,9 +71,17 @@ Fix:
   3. Alternative: Move to Fargate (no ENI limit problem)
 ```
 
+ENI exhaustion is one of the most common capacity issues when running ECS with awsvpc networking at scale. Each task in awsvpc mode gets its own dedicated Elastic Network Interface. Smaller EC2 instances have low ENI limits:
+
+- t3.micro: 2 ENIs (1 host + 1 task)
+- c5.xlarge: 4 ENIs (1 host + 3 tasks)
+- c5.4xlarge: 8 ENIs (1 host + 7 tasks)
+
+ENI Trunking (awsvpcTrunking) is the recommended solution. It uses a "trunk ENI" technique to allow up to 120 tasks per Nitro-based instance. Requires ECS Agent version 1.55.0 or later and Nitro-based instances (most modern instance types).
+
 ---
 
-## 🔴 EDGE CASE 3: Out of Memory Kill
+## EDGE CASE 3: Out of Memory Kill
 
 ```
 Symptom: Container exits with code 137 (SIGKILL from kernel OOM killer)
@@ -87,13 +99,13 @@ Debug:
 Fix (immediate):
   # Increase memory hard limit:
   "memory": 2048  →  "memory": 4096
-  
+
 Fix (root cause):
   1. Memory leak: Analyze heap dumps, fix leak
   2. Natural growth: Increase limit appropriately
   3. JVM: Set -XX:MaxRAMPercentage=75 (proper container awareness)
   4. Node.js: --max-old-space-size=XYYY where XYYY < (memory limit × 0.8 in MB)
-  
+
 Node.js memory cap:
   Container memory: 1024MB
   Node heap: 1024 × 0.8 = 819MB → --max-old-space-size=819
@@ -102,7 +114,7 @@ Node.js memory cap:
 
 ---
 
-## 🔴 EDGE CASE 4: Health Check Flapping
+## EDGE CASE 4: Health Check Flapping
 
 ```
 Symptom: Task keeps getting deregistered from ALB → registered → deregistered
@@ -121,15 +133,15 @@ Debug:
 Fix strategies:
   1. Lightweight health endpoint:
      /health → 200 OK instantly (no DB check, no external calls)
-  
+
   2. Increase health check tolerances:
      unhealthyThresholdCount: 5 (vs default 2)
      healthCheckIntervalSeconds: 60 (vs default 30)
-  
+
   3. GC pause causing timeouts:
      healthCheckTimeoutSeconds: 10 (increase timeout)
      Or: Add JVM GC tuning to reduce pause duration
-  
+
   4. Slow start (Spring Boot, heavy JVM):
      startPeriod: 120  # in Task Definition ECS health check
      ALB: healthCheckIntervalSeconds: 60 + unhealthyThresholdCount: 5
@@ -137,7 +149,7 @@ Fix strategies:
 
 ---
 
-## 🔴 EDGE CASE 5: IAM Permission Denial at Runtime
+## EDGE CASE 5: IAM Permission Denial at Runtime
 
 ```
 Symptom: App working locally, fails in ECS with "AccessDeniedException"
@@ -149,7 +161,7 @@ Debug process:
     --lookup-attributes AttributeKey=ErrorCode,AttributeValue=AccessDenied \
     --start-time 2024-01-15T10:00:00Z \
     --end-time 2024-01-15T11:00:00Z
-  
+
   # Step 2: See exact resource and action:
   {
     "eventName": "GetObject",
@@ -161,7 +173,7 @@ Debug process:
       "arn": "arn:aws:sts::123:assumed-role/myapp-task-role/..."  ← Task Role!
     }
   }
-  
+
   # Step 3: Simulate the permission check:
   aws iam simulate-principal-policy \
     --policy-source-arn arn:aws:iam::123:role/myapp-task-role \
@@ -172,9 +184,13 @@ Debug process:
   # If "ALLOW" → check resource-based policy (bucket policy blocking?)
 ```
 
+The `iam simulate-principal-policy` command is invaluable for debugging IAM issues before making policy changes. It shows exactly what the policy evaluation result would be for a given principal, action, and resource — including whether a deny comes from an identity policy or a resource policy.
+
+A common mistake: granting s3:GetObject to the Task Role but forgetting that the S3 bucket has a bucket policy that denies access to unknown principals. Both the Task Role identity policy AND the S3 bucket policy must allow the access.
+
 ---
 
-## 🔴 EDGE CASE 6: Rolling Update Stuck at 50%
+## EDGE CASE 6: Rolling Update Stuck at 50%
 
 ```
 Symptom: "2 of 4 tasks updated" message stays for 10+ minutes
@@ -184,12 +200,12 @@ Debugging decision tree:
 
 1. New tasks launching?
    aws ecs list-tasks --cluster prod --service-name myapp --desired-status RUNNING
-   
-   a. NEW TASKS EXIST → they're just not passing health checks
+
+   a. NEW TASKS EXIST → they are not passing health checks
       Check: aws ecs describe-tasks → container health status
       Check: ALB target health (are new tasks HEALTHY in target group?)
       → Fix the health check issue!
-   
+
    b. NO NEW TASKS → placement issue
       Check: aws ecs describe-services → events → "unable to place"
       Common: Not enough capacity (EC2 mode) OR Fargate limit hit
@@ -200,7 +216,7 @@ Debugging decision tree:
    aws elbv2 describe-target-group-attributes \
      --target-group-arn arn:...:targetgroup/myapp-tg/...
    → deregistration_delay.timeout_seconds = 300 (5 minutes!)
-   
+
    Fix: Set to 30-60 seconds for stateless HTTP services!
 
 3. Circuit breaker triggered (if enabled)?
@@ -211,7 +227,37 @@ Debugging decision tree:
 
 ---
 
-## 🛠️ Master Debug Cheat Sheet
+## EDGE CASE 7: Task Stuck in PENDING State
+
+```
+Symptom: Tasks show as PENDING and never transition to RUNNING
+
+Causes:
+  1. No available capacity (EC2 mode)
+     → ecs describe-services events → "service was unable to place a task"
+     → Add EC2 capacity OR reduce task CPU/memory requirements
+
+  2. Placement constraint violation
+     → distinctInstance constraint: not enough instances for desired task count
+     → memberOf constraint: no instances match the attribute expression
+
+  3. Port conflict (bridge mode)
+     → Two tasks require same host port
+     → Use dynamic port mapping or awsvpc mode
+
+  4. Fargate capacity limit hit
+     → Rare but possible during large scale-outs
+     → Try different AZ or reduce task size
+
+Debug:
+  aws ecs describe-services --cluster prod --services myapp \
+    | jq '.services[0].events[:5]'
+  # Events contain "reason" explaining why placement failed
+```
+
+---
+
+## Master Debug Cheat Sheet
 
 ```bash
 # === QUICK TRIAGE COMMANDS ===
@@ -245,24 +291,43 @@ aws ecs stop-task --cluster production --task $TASK --reason "Manual replacement
 aws ecs update-service --cluster production --service myapp --force-new-deployment
 ```
 
+### ECS Execute Command — Prerequisites
+
+The `ecs execute-command` feature (SSM-based exec into running container) requires:
+1. `ExecuteCommand` enabled on the ECS service: `--enable-execute-command`
+2. Task Role must have SSM permissions:
+   ```json
+   {
+     "Effect": "Allow",
+     "Action": [
+       "ssmmessages:CreateControlChannel",
+       "ssmmessages:CreateDataChannel",
+       "ssmmessages:OpenControlChannel",
+       "ssmmessages:OpenDataChannel"
+     ],
+     "Resource": "*"
+   }
+   ```
+3. SSM Agent running in the container (Amazon Linux 2 images include it; custom images may not)
+
 ---
 
-## 🎤 Interview Angle
+## Interview Angle
 
-**Q: "ECS Container jo chalat nahi isko kaise debug karoge step by step?"**
+**Q: "How do you debug an ECS container that is not starting? Walk through your step-by-step approach."**
 
 > My systematic approach:
-> 1. **Service events first:** `describe-services` → `.events` → "unable to place" (capacity issue) or "task stopped"
-> 2. **Stopped task reason:** `describe-tasks` → `stoppedReason` + `containers[].exitCode`
->    - Exit 137 = OOM → increase memory
+> 1. **Service events first:** `describe-services` → `.events` → look for "unable to place" (capacity issue) or task stopped messages
+> 2. **Stopped task reason:** `describe-tasks` → `stoppedReason` plus `containers[].exitCode`
+>    - Exit 137 = OOM → increase memory limit
 >    - TaskFailedToStart → image pull or secret fetch issue
 >    - Exit 1 = app error → check logs
-> 3. **Logs:** `aws logs tail /ecs/myapp --follow` → actual error message
-> 4. **If IAM:** CloudTrail → AccessDenied events → which API call failing → add to Task Role
-> 5. **If network:** VPC Flow logs or test connectivity from same VPC/subnet
-> 6. **Live debug:** `ecs execute-command` → exec into running container → investigate live
-> 7. **Permission simulation:** `iam simulate-principal-policy` → test before changing policies
+> 3. **Logs:** `aws logs tail /ecs/myapp --follow` → look for the actual error message
+> 4. **If IAM issue:** CloudTrail → AccessDenied events → identify which API call is failing → add to Task Role or check resource policy
+> 5. **If network issue:** VPC Flow Logs or test connectivity from same VPC/subnet using a test EC2 instance
+> 6. **Live debug:** `ecs execute-command` → exec into running container → investigate file system, environment variables, and network connectivity live
+> 7. **Permission simulation:** `iam simulate-principal-policy` → verify policy allows the action before making changes
 
 ---
 
-*🎉 Curriculum Complete! You are now equipped to be an AWS ECR + ECS God!*
+*Phase 4 Nearing Complete! Next: [05_Interview_Questions_Mastery.md →](./05_Interview_Questions_Mastery.md)*

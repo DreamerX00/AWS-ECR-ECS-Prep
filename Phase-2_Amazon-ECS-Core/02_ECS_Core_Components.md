@@ -1,14 +1,14 @@
-# 🧩 ECS Core Components — Complete Reference
+# ECS Core Components — Complete Reference
 
 ---
 
-## 📖 Overview
+## Overview
 
-ECS ke 6 core components ko ek pizza delivery company ke through samjhenge. Ek ek karke.
+ECS has 6 core components. This document explains each one in depth using a pizza delivery company as a running analogy, followed by real-world technical detail.
 
 ---
 
-## 1️⃣ CLUSTER — The Company
+## 1. CLUSTER — The Company
 
 ```
 A logical grouping of infrastructure where your containers run.
@@ -25,11 +25,11 @@ ECS Cluster "production":
 └── Container Insights settings
 ```
 
-**Analogy:** Pizza company "RapidPizza" = ECS Cluster. Company ek logical box hai jisme sab kuch hota hai.
+**Analogy:** The pizza company "RapidPizza" is the ECS Cluster. The company is a logical boundary that contains everything: capacity, services, tasks, and configuration.
 
 **Real-world:** Typically one cluster per environment:
 - `myapp-dev`
-- `myapp-staging`  
+- `myapp-staging`
 - `myapp-production`
 
 ```bash
@@ -43,9 +43,11 @@ aws ecs create-cluster \
     capacityProvider=FARGATE_SPOT,weight=4
 ```
 
+**Key consideration:** You can share a cluster across multiple services and teams, but separating clusters per environment (dev/staging/prod) provides cleaner IAM boundaries, independent scaling behavior, and avoids accidental cross-environment impact during deployments or incidents.
+
 ---
 
-## 2️⃣ TASK DEFINITION — The Recipe
+## 2. TASK DEFINITION — The Recipe
 
 ```
 A JSON blueprint describing:
@@ -60,7 +62,7 @@ A JSON blueprint describing:
 - Secrets
 ```
 
-**Analogy:** Pizza recipe card — "Margherita Pizza: 200g dough, 150g sauce, 100g cheese, bake at 250°C for 12 min"
+**Analogy:** A pizza recipe card — "Margherita Pizza: 200g dough, 150g sauce, 100g cheese, bake at 250°C for 12 min"
 
 ```json
 // Complete Task Definition Example:
@@ -72,7 +74,7 @@ A JSON blueprint describing:
   "requiresCompatibilities": ["FARGATE"],   // or EC2
   "cpu": "512",                             // 0.5 vCPU (for the whole task)
   "memory": "1024",                         // 1GB RAM
-  
+
   "containerDefinitions": [
     {
       "name": "app",
@@ -81,21 +83,21 @@ A JSON blueprint describing:
       "memory": 512,    // Hard limit (OOM kill if exceeded)
       "memoryReservation": 256,  // Soft limit (can burst to memory hard limit)
       "essential": true,         // If this crashes, ENTIRE task stops
-      
+
       "portMappings": [{"containerPort": 3000, "protocol": "tcp"}],
-      
+
       "environment": [
         {"name": "NODE_ENV", "value": "production"},
         {"name": "PORT", "value": "3000"}
       ],
-      
+
       "secrets": [
         {
           "name": "DB_PASSWORD",
           "valueFrom": "arn:aws:secretsmanager:us-east-1:123:secret:myapp/db-password"
         }
       ],
-      
+
       "logConfiguration": {
         "logDriver": "awslogs",
         "options": {
@@ -104,7 +106,7 @@ A JSON blueprint describing:
           "awslogs-stream-prefix": "ecs"
         }
       },
-      
+
       "healthCheck": {
         "command": ["CMD-SHELL", "curl -f http://localhost:3000/health || exit 1"],
         "interval": 30,
@@ -113,7 +115,7 @@ A JSON blueprint describing:
         "startPeriod": 60   // Grace period for slow-starting apps
       }
     },
-    
+
     // SIDECAR CONTAINER (optional)
     {
       "name": "log-router",
@@ -124,7 +126,7 @@ A JSON blueprint describing:
       ...
     }
   ],
-  
+
   "volumes": [
     {
       "name": "shared-data",
@@ -154,16 +156,18 @@ aws ecs deregister-task-definition --task-definition myapp:1
 # Note: Deregistered, not deleted. Still viewable but can't launch new tasks.
 ```
 
+**Important:** Task definitions are immutable — each update creates a new numbered revision. Services reference a specific revision (e.g., `myapp:5`). When you update a service to use `myapp:6`, the old `myapp:5` tasks are gracefully replaced during a rolling deployment.
+
 ---
 
-## 3️⃣ TASK — One Running Order
+## 3. TASK — One Running Order
 
 ```
 A running (or stopped) instance of a Task Definition.
 = actual pizza being made from the recipe
 ```
 
-**Analogy:** Ek specific pizza order #4521 — recipe se bana, specific oven mein, specific time pe.
+**Analogy:** A specific pizza order #4521 — made from the recipe, in a specific oven, at a specific time.
 
 ```
 Task States:
@@ -203,31 +207,33 @@ PROVISIONING:
 PENDING:
   Image pull starts (from ECR)
   Secrets fetched (Secrets Manager / SSM)
-  
+
 ACTIVATING:
   Container starting
   Health check startPeriod begins
-  
+
 RUNNING:
   Container healthy and running
   Service maintains this state
-  
+
 DEACTIVATING/STOPPING:
   Task stop requested
   ECS sends SIGTERM → waits stopTimeout → sends SIGKILL
   stopTimeout default: 30 seconds (configurable up to 120s)
 ```
 
+**Best practice for PENDING tasks stuck at image pull:** Ensure the execution role has ECR permissions, the ECR repository policy allows the account, and the subnet has NAT Gateway or VPC endpoint access to ECR. A task stuck in PENDING for more than 5 minutes almost always indicates an image pull failure or a missing secret.
+
 ---
 
-## 4️⃣ SERVICE — The Manager
+## 4. SERVICE — The Manager
 
 ```
 Long-running manager that ensures N tasks are always running.
 Handles: task deployment, health monitoring, scaling, load balancer registration.
 ```
 
-**Analogy:** Pizza outlet floor manager — "We always need 3 cashiers. If one quits, immediately hire another. During rush: hire 10."
+**Analogy:** The floor manager at a pizza outlet — "We always need 3 cashiers. If one quits, hire another immediately. During rush hour, bring in 10."
 
 ```bash
 # Create ECS Service
@@ -263,7 +269,7 @@ TASK:
   - Run once, collect metrics, done
   - Database migration: run to completion, exit
   - No restart on failure
-  
+
 SERVICE:
   - Long-lived: web server, API, worker
   - Auto-restart on failure
@@ -272,16 +278,19 @@ SERVICE:
   - Rolling deployments
 ```
 
+### Deployment Circuit Breaker (Critical for Production):
+When `deploymentCircuitBreaker` is enabled, ECS monitors the rolling deployment. If a configurable number of consecutive task launches fail health checks, ECS automatically rolls back the service to the last known stable task definition revision. This prevents a broken deployment from replacing all healthy tasks with unhealthy ones before anyone notices.
+
 ---
 
-## 5️⃣ CONTAINER — The Worker
+## 5. CONTAINER — The Worker
 
 ```
 The actual running process inside a task.
 One task can have multiple containers (multi-container task).
 ```
 
-**Analogy:** Individual worker performing a specific job within the pizza outlet.
+**Analogy:** An individual worker performing a specific job inside the pizza outlet.
 
 ### Essential vs Non-Essential Containers:
 ```json
@@ -291,7 +300,7 @@ One task can have multiple containers (multi-container task).
 
 // Non-essential container (sidecar):
 {"name": "metrics-exporter", "essential": false}
-// Metrics crashes → Task keeps running (app still serves!)
+// Metrics crashes → Task keeps running (app still serves traffic!)
 ```
 
 ### Multi-Container Task:
@@ -319,21 +328,38 @@ One task can have multiple containers (multi-container task).
 }
 ```
 
+### Container Dependencies:
+For multi-container tasks where one container must start before another, use `dependsOn`:
+
+```json
+{
+  "name": "app",
+  "dependsOn": [
+    {
+      "containerName": "init-db",
+      "condition": "SUCCESS"   // Wait for init-db to exit 0 before starting app
+    }
+  ]
+}
+```
+
+This is how init containers (database migrations, config setup) are implemented in ECS without Kubernetes's dedicated init container concept.
+
 ---
 
-## 6️⃣ CAPACITY PROVIDER — The Venue
+## 6. CAPACITY PROVIDER — The Venue
 
 ```
 Defines the infrastructure (EC2 ASG or Fargate/Fargate Spot)
 where tasks get scheduled.
 ```
 
-**Analogy:** Decides which kitchen (cloud kitchen vs physical outlet vs ghost kitchen) the pizza order goes to.
+**Analogy:** Decides which kitchen — cloud kitchen, physical outlet, or ghost kitchen — the pizza order goes to.
 
 ### Types:
 ```
-FARGATE          → AWS managed serverless (recommended for most)
-FARGATE_SPOT     → 70% cheaper, can be interrupted (good for batch)
+FARGATE          → AWS managed serverless (recommended for most workloads)
+FARGATE_SPOT     → 70% cheaper, can be interrupted (good for batch processing)
 EC2 ASG          → You manage EC2 instances, linked via Auto Scaling Group
 ```
 
@@ -349,13 +375,15 @@ aws ecs create-capacity-provider \
       "minimumScalingStepSize": 1,
       "maximumScalingStepSize": 10
     },
-    "managedTerminationProtection": "ENABLED"  // Don't kill EC2 with running tasks!
+    "managedTerminationProtection": "ENABLED"  // Don't terminate EC2 with running tasks!
   }'
 ```
 
+**Managed scaling explained:** When `managedScaling` is enabled on a capacity provider, ECS calculates the number of EC2 instances required to satisfy the number of pending tasks. It then sends a scale-out or scale-in signal to the Auto Scaling Group automatically, so you do not need to manually tune ASG scaling policies. The `targetCapacity` of 80% leaves headroom for burst without triggering immediate scale-out.
+
 ---
 
-## 🎯 Putting It All Together — Component Flow
+## Putting It All Together — Component Flow
 
 ```
                     ┌─────────────────────────────┐
@@ -384,17 +412,17 @@ aws ecs create-capacity-provider \
 
 ---
 
-## 🚨 Gotchas & Edge Cases
+## Gotchas & Edge Cases
 
 ### 1. Task Stop — SIGTERM Then SIGKILL
 ```
-ECS task stop karo:
+When a task is stopped:
 → ECS sends SIGTERM to container
-→ App has 30 seconds (stopTimeout) to gracefully shutdown
+→ App has 30 seconds (stopTimeout) to gracefully shut down
 → If not stopped → SIGKILL (forced kill)
 
 If your app ignores SIGTERM (many Node.js apps do!):
-→ In-flight requests dropped, DB connections not closed cleanly
+→ In-flight requests are dropped, DB connections are not closed cleanly
 → Fix: Handle SIGTERM in your app!
 
 Node.js:
@@ -418,33 +446,46 @@ CPU: 4096 (4 vCPU):  Memory 8192-30720 (1GB increments)
 Invalid combinations fail at task launch!
 ```
 
-### 3. Service Desired Count = 0 ≠ Delete Service
+### 3. Service Desired Count = 0 Does Not Delete the Service
 ```bash
 # Stop all tasks without deleting service:
 aws ecs update-service --cluster prod --service myapp --desired-count 0
 
-# Service stays, no tasks running, no cost (Fargate)
-# Scale back up: update-service --desired-count 3
-# Useful for maintenance windows!
+# Service remains; no tasks run; no Fargate cost is incurred
+# Scale back up when ready: update-service --desired-count 3
+# Useful for maintenance windows and cost reduction in non-prod environments!
+```
+
+### 4. Task Definition Secrets vs Environment Variables
+```
+Environment variables in task definitions are stored in PLAINTEXT in the ECS console
+and API responses. Never put passwords, API keys, or certificates as environment variables.
+
+Use "secrets" field instead:
+  - Values are fetched from Secrets Manager or SSM Parameter Store at task launch
+  - The actual secret value is never stored in the task definition
+  - Requires the execution role to have secretsmanager:GetSecretValue permission
+  - Supports automatic secret rotation without redeploying the task definition
 ```
 
 ---
 
-## 🎤 Interview Angle
+## Interview Questions
 
-**Q: "Task aur Service mein kya farq hai? Kab kaunsa use karein?"**
+**Q: "What is the difference between a Task and a Service? When do you use each?"**
 
-> Task = ek temporary running instance. Database migration, batch job ke liye.
-> Service = permanent manager. Web server, API, worker ke liye.
-> Service ensures desired count tasks hamesha running hon. Crash pe auto-restart.
-> Service + ALB + Auto Scaling = production-grade setup.
+> A Task is a temporary running instance of a task definition. It is used for database migrations, batch jobs, and one-time scripts — it runs to completion and stops.
+> A Service is a long-running manager that ensures a desired number of tasks are always running. It is used for web servers, APIs, and background workers.
+> A Service handles auto-restart on failure, rolling deployments, ALB registration, and auto-scaling. A Task does none of these automatically.
+> For production services, always use a Service. Use standalone Tasks only for jobs with a defined completion point.
 
-**Q: "ECS ka essential container flag kya karta hai?"**
+**Q: "What does the essential flag do on an ECS container definition?"**
 
-> Essential container crash ho → poora task stop.
-> ECS Service phir ek naaya task start karta hai (desired state maintain karne ke liye).
-> Non-essential container crash ho → sirf woh container fails, task aur essential containers chalte rahte hain.
-> Sidecars (log routers, monitoring agents) essential: false honI chahiye, warna ek sidecar crash = app downtime!
+> When an essential container exits (for any reason, including a crash), ECS stops the entire task.
+> The ECS Service then replaces the stopped task with a new one to maintain the desired count.
+> Non-essential containers, such as log routers and monitoring sidecars, should have `essential: false`.
+> This way, a sidecar crash does not cause the entire task to restart and interrupt application traffic.
+> A common production mistake is marking all containers as essential, causing outages when a sidecar has a transient failure.
 
 ---
 
